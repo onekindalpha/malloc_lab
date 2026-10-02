@@ -52,4 +52,5 @@ mdriver
 modules.order
 Module.symvers
 Mkfile.old
-dkms.conf
+dkms.conf*.o
+mdriver
