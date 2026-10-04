@@ -39,7 +39,7 @@ team_t team = {
 #define ALIGNMENT 8
 
 /* rounds up to the nearest multiple of ALIGNMENT */
-/* 마지막 3비트를 0으로 만든다 -> 크기를 8의 배수로 맞춤. */
+/* 마지막 3비트를 0으로 만든다 -> 크기를 8의 배수로 맞춘다. 올린다.  */
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7)
 
 /* Size_t하나를 저장하는데 필요한 공간을 8바이트 정렬 기준으로 계산한다.  */
@@ -72,6 +72,26 @@ static void *extend_heap(size_t words);
 static void *find_fit(size_t asize);
 static void *coalesce(void *bp);
 static void place(void *bp, size_t asize);
+int mm_check(void);
+
+#define DEBUG // "DEBUG라는 이름이 존재한다"고 표시만 함 (값은 없음)
+              // 이 줄을 주석 처리하면 → DEBUG가 없는 상태
+
+#ifdef DEBUG // 만약 DEBUG가 존재하면 (= 검사 켜짐)
+#define CHECKHEAP()                            \
+    do                                         \
+    {                                          \
+        if (!mm_check())                       \
+        {                                      \
+            printf("힙 깨짐! %s\n", __func__); \
+            exit(1);                           \
+        }                                      \
+    } while (0)
+//   CHECKHEAP()를 → "mm_check를 실행하고, 0이 나오면 메시지 찍고 프로그램 종료"로 바꿔라
+
+#else               // DEBUG가 없으면 (= 검사 꺼짐)
+#define CHECKHEAP() //   CHECKHEAP()를 → 아무것도 없는 것으로 바꿔라 (그 줄이 사라진 것과 같음)
+#endif              // 조건 끝
 
 /*
  * mm_init - initialize the malloc package.
@@ -90,6 +110,7 @@ int mm_init(void)
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
+    CHECKHEAP();
     return 0;
 }
 
@@ -116,9 +137,9 @@ static void *extend_heap(size_t words)
 
     /* Coalesce if the previous block was free */
     /* 앞 블록이 가용이면 합치기 */
+    CHECKHEAP();
     return coalesce(bp);
 }
-
 /* static find_fit */
 static void *find_fit(size_t asize)
 {
@@ -127,17 +148,14 @@ static void *find_fit(size_t asize)
     /* 현재 헤더에서 읽힌 크기가 0보다 클 동안 다음 블록으로 이동한다. */
     for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
     {
-        /* 블록이 가용이고 asize(필요한 블록 크기) 보다 현재 에서 읽힌 크기가 더 클 때 */
         if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp))))
         {
-            /* 시작 주소를 반환한다. */
             return bp;
         }
     }
-    /*못 찾은 경우 extend_heap으로 값을 늘림 */
+    // 여기서 널을 반환하면 Mm_malloc에서 검사를 해서 알맞은 공간이 없으면 extend_heap을 한다.
     return NULL;
 }
-
 /* static place */
 static void place(void *bp, size_t asize)
 {
@@ -191,9 +209,9 @@ void *mm_malloc(size_t size)
         return NULL;
     /* 새로 생긴 빈 블록에 배치. */
     place(bp, asize);
+    CHECKHEAP();
     return bp;
 }
-
 #endif
 #if 0
 void *mm_malloc(size_t size)
@@ -219,6 +237,7 @@ void mm_free(void *ptr)
     PUT(HDRP(ptr), PACK(size, 0));
     PUT(FTRP(ptr), PACK(size, 0));
     coalesce(ptr);
+    CHECKHEAP();
 }
 
 void *coalesce(void *ptr)
@@ -269,35 +288,105 @@ void *coalesce(void *ptr)
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
+/* ptr 크기를 바꿀 옛 블록의 주소(bp). size = 새로 원하는 크기 */
+
 void *mm_realloc(void *ptr, size_t size)
 {
+    /* 옛 블록을 알기 쉬운 이름으로 복사 */
     void *oldptr = ptr;
+    /* 새 블록 주소를 담을 변수 */
     void *newptr;
+    /* 옛 블록에서 새 블록으로 복사할 바이트 수*/
     size_t copySize;
-
+    /* 새 크기로 새. ㅡㄹ. 로을 받음 (우리가 만든 mm_malloc 사용) */
     newptr = mm_malloc(size);
+    /* 새 블록을 못 받았으면 */
     if (newptr == NULL)
+        /* 실패를 알림. 옛 블록을 그대로 둠. */
         return NULL;
+    /* 옛 데이터 크기 읽기 - 지금의 블록 구조와 왜 안맞는 거지 */
     copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+    printf("copySize = %zu, 헤더 크기 = %u\n", copySize, GET_SIZE(HDRP(oldptr)));
+    /* 새 크기가 옜 데이터보다 작으면 (= 줄이는 경우)*/
     if (size < copySize)
+        /* 새 블록에 들어가는 만큼만 복사 */
         copySize = size;
+    /* oldptr에서 copysize바이트를 newptr로 복사*/
     memcpy(newptr, oldptr, copySize);
+    /* 옜 블록 반납 (복사가 끝난 뒤에 )*/
     mm_free(oldptr);
+    CHECKHEAP();
+    /* 새 블록 주소를 돌려줌. */
     return newptr;
 }
 
-/* 디버깅용 : 힙의 모든 블록을 출력한다. */
-static void print_heap(const char *msg)
+/*
+* mm_check - 힙을 처음부터 끝까지 훑으면서 일관성을 검사한다.
+힙이 정상이면 1(0이 아닌 값), 문제가 있으면 오류를 출력하고 0을 반환한다.
+검사 항목: 1) 프롤로그 2) 정렬 3) 최소 크기 4) 헤더 = 풋터 5) 힙 범위
+6) 연속된 빈 블록 7) 에필로그)
+*/
+int mm_check(void)
 {
-    char *bp;
-    printf("---- %s ----\n", msg);
-    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    char *bp = heap_listp;
+    int ok = 1;        // 하나라도 실패하면 0으로 바꿈
+    int prev_free = 0; // 바로 앞 블록이 빈 블록이었는지
+
+    // 1) 프롤로그 : heap_listp 블록의 크기가 DSIZE, 할당 1인가?
+    if (GET_SIZE(HDRP(bp)) != DSIZE || !GET_ALLOC(HDRP(bp)))
     {
-        printf("bp=%p  헤더 %u/%u  풋터 %u/%u%s\n",
-               bp,
-               GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)),
-               GET_SIZE(FTRP(bp)), GET_ALLOC(FTRP(bp)),
-               GET(HDRP(bp)) != GET(FTRP(bp)) ? "   ← 헤더≠풋터!" : "");
+        printf("프롤로그 블록이 정상이 아님\n");
+        ok = 0;
     }
-    printf("에필로그 bp=%p  헤더 %u/%u\n\n", bp, GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)));
+    for (bp = NEXT_BLKP(heap_listp); GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
+    {
+        // 2) 정렬 : 주소를 정수로 바꿔 8으로 나눈 나머지 -> (size_t)bp % ALIGNMENT
+        if ((size_t)bp % ALIGNMENT)
+        {
+            printf("정렬 오류 : bp=%p\n", bp);
+            ok = 0;
+        }
+        // 3) 크기: 8의 배수이고 16 이상인가?
+        if (GET_SIZE(HDRP(bp)) % ALIGNMENT || GET_SIZE(HDRP(bp)) <= 16)
+        {
+            printf("크기 오류 : bp=%p, 크기=%u\n", bp, GET_SIZE(HDRP(bp)));
+            ok = 0;
+        }
+        // 4) 헤더 = 풋터: 헤더와 풋터가 같은가?
+        if (GET(HDRP(bp)) != GET(FTRP(bp)))
+        {
+            printf("[mm_check] %p: 헤더(%u/%u) != 풋터(%u/%u)\n", bp,
+                   GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)),
+                   GET_SIZE(FTRP(bp)), GET_ALLOC(FTRP(bp)));
+            ok = 0;
+        }
+        // 5) 힙 범위 : bp가 mem_heap_lo()와 mem_heap_hi() 사이에 있는가?
+        if (bp < mem_heap_lo() || bp > mem_heap_hi())
+        {
+            printf("힙 범위 오류 : bp=%p, 힙 범위=[%p, %p]\n", bp, mem_heap_lo(), mem_heap_hi());
+            ok = 0;
+        }
+        // 6) 연속된 빈 블록: 앞 블록도 비었고 지금 블록도 비었으면 오류
+        if (prev_free && !GET_ALLOC(HDRP(bp)))
+        {
+            printf("연속된 빈 블록 오류 : bp=%p\n", bp);
+            ok = 0;
+        }
+        // 다음 블록을 위해 prev_free 갱신
+        prev_free = !GET_ALLOC(HDRP(bp));
+    }
+    // 7) 에필로그: 마지막 블록의 크기가 0이고 할당 1인가?
+    // 여기서 세그폴트 오류가 났음.
+    if (GET_SIZE(HDRP(bp)) != 0 || !GET_ALLOC(HDRP(bp)))
+    {
+        printf("에필로그 블록 오류 : bp=%p, 헤더=%u/%u\n", bp, GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)));
+        ok = 0;
+    }
+    // 8) 서로 겹치는 블록까지 다 다룸.
+    if ((char *)NEXT_BLKP(bp) <= bp)
+    {
+        printf("겹치는 블록 오류 : bp=%p, 다음 블록=%p\n", bp, NEXT_BLKP(bp));
+        ok = 0;
+    }
+    return ok;
 }
