@@ -66,17 +66,28 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE))) // Given block ptr bp, compute address of next block
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE))) // Given block ptr bp, compute address of previous block
 
+/* Seg_list를 만들기 위해 새로 만든 매크로들 */
+/* 최소 블록 크기 24 */
+#define MINBLOCK 24
+#define PRED(bp) (*(char **)(bp))                   /* bp 위치의 8바이트 = 앞 블록 주소 */
+#define SUCC(bp) (*(char **)((char *)(bp) + DSIZE)) /* bp +8 위치의 8바이트 =. ㅟ 블록 주소 */
+
+/* 전역변수를 많이 쓰지 말라고 함. 아래 정도면 괜찮겠지 */
+
 static char *heap_listp; // Pointer to first block
+static char *free_listp; //
 
 static void *extend_heap(size_t words);
 static void *find_fit(size_t asize);
-static void insert_block(void *bp);
 static void *coalesce(void *bp);
 static void place(void *bp, size_t asize);
+static void remove_block(void *bp);
+static void insert_block(void *bp);
+
 int mm_check(void);
 
-#define DEBUG // "DEBUG라는 이름이 존재한다"고 표시만 함 (값은 없음)
-              // 이 줄을 주석 처리하면 → DEBUG가 없는 상태
+// #define DEBUG // "DEBUG라는 이름이 존재한다"고 표시만 함 (값은 없음)
+//  이 줄을 주석 처리하면 → DEBUG가 없는 상태
 
 #ifdef DEBUG // 만약 DEBUG가 존재하면 (= 검사 켜짐)
 #define CHECKHEAP()                            \
@@ -107,7 +118,7 @@ int mm_init(void)
     PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); // Prologue footer
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     // Epilogue header
     heap_listp += (2 * WSIZE);
-
+    free_listp = NULL; // for seglist
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
@@ -138,17 +149,18 @@ static void *extend_heap(size_t words)
 
     /* Coalesce if the previous block was free */
     /* 앞 블록이 가용이면 합치기 */
-    CHECKHEAP();
     return coalesce(bp);
 }
+
 /* static find_fit */
 static void *find_fit(size_t asize)
 {
     /* First Fit Search*/
     void *bp;
-    for (bp = heap_listp; bp != NULL; bp = SUCC(bp))
+    /* 현재 헤더에서 읽힌 크기가 0보다 클 동안 다음 블록으로 이동한다. */
+    for (bp = free_listp; bp != NULL; bp = SUCC(bp))
     {
-        // 우리가 관리하는 빈 리스트만 훑기 때문에 할당여부를 검사할 필요가 없음.
+        // 할당여부는 검사할 필요가 없음.
         if (asize <= GET_SIZE(HDRP(bp)))
         {
             return bp;
@@ -158,23 +170,58 @@ static void *find_fit(size_t asize)
     return NULL;
 }
 
-/* static place */
+/* static seglist의 remove block*/
+static void remove_block(void *bp)
+{
+
+    /*일단 세개의 케이스를 나눠서 지운다. */
+    /* 일단 내 앞이 있으면 */
+    if (PRED(bp) != NULL)
+        SUCC(PRED(bp)) = SUCC(bp);
+    /* 맨 앞이 나일때*/
+    else
+        free_listp = SUCC(bp);
+    /* 일단 내 뒤가 있으면 */
+    if (SUCC(bp) != NULL)
+        PRED(SUCC(bp)) = PRED(bp);
+}
+
+/* static seglist의 insert block*/
+static void insert_block(void *bp)
+{
+    /* 프리리스트 관리할때 맨 앞에 넣어서 관리를 함. 그게 편하기 때문임.*/
+    /* 처음에 아예 프리리스트가 비어있다고 생각을 하고 구현을 함 */
+    /* 내 뒤와 앞을 정한다. */
+    SUCC(bp) = free_listp;
+    PRED(bp) = NULL;
+    if (free_listp != NULL)
+    {
+        PRED(free_listp) = bp;
+    }
+    free_listp = bp;
+}
+
+/* static seglist의 place */
 static void place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp)); // 현재 블록의 크기
 
-    if ((csize - asize) >= (2 * DSIZE))
+    /* 지금 프리리스트로 빼는 애를 remove를 먼저 한다. */
+    remove_block(bp);
+    /* 그 다음에 insert를 진행을 한다. */
+    if ((csize - asize) >= (MINBLOCK))
     {
         // 현재 블록 크기에서 요청한 크기를 뺀 것이 최소 블록 이상이면
-        PUT(HDRP(bp), PACK(asize, 1));         // 현재 블록 헤더를 요청한 크기로 바꾼다.
-        PUT(FTRP(bp), PACK(asize, 1));         // 현재 블록 풋터를 요청한 크기로 바꾼다.
-        bp = NEXT_BLKP(bp);                    // bp를 다음 블록으로 이동
+        PUT(HDRP(bp), PACK(asize, 1)); // 현재 블록 헤더를 요청한 크기로 바꾼다.
+        PUT(FTRP(bp), PACK(asize, 1)); // 현재 블록 풋터를 요청한 크기로 바꾼다.
+        bp = NEXT_BLKP(bp);
         PUT(HDRP(bp), PACK(csize - asize, 0)); // 다음 블록 헤더를 남는 크기로 바꾼다.
         PUT(FTRP(bp), PACK(csize - asize, 0)); // 다음 블록 풋터를 남는 크기로 바꾼다.
+        insert_block(bp);                      // insert_block을 진행을 한다.
     }
     else
     {
-        PUT(HDRP(bp), PACK(csize, 1)); // 통째로 할당함
+        PUT(HDRP(bp), PACK(csize, 1)); //
         PUT(FTRP(bp), PACK(csize, 1));
     }
 }
@@ -193,7 +240,7 @@ void *mm_malloc(size_t size)
     if (size == 0)
         return NULL;
     if (size <= DSIZE)
-        asize = 2 * DSIZE; // 최소 블록 크기 16바이트
+        asize = MINBLOCK; // 최소 블록 크기 24바이트
     else
         asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE); // size + 헤더/풋터 + 정렬
     /* 먼저 파인드 핏으로 찾아본다. */
@@ -201,6 +248,7 @@ void *mm_malloc(size_t size)
     {
         /* 찾았으면 그 자리에 배치 */
         place(bp, asize);
+        CHECKHEAP();
         /* 반환*/
         return bp;
     }
@@ -214,6 +262,7 @@ void *mm_malloc(size_t size)
     CHECKHEAP();
     return bp;
 }
+
 #endif
 #if 0
 void *mm_malloc(size_t size)
@@ -250,10 +299,10 @@ void *coalesce(void *ptr)
 
     if (prev_alloc && next_alloc) // Case 1
     {
-        return ptr;
     }
     else if (prev_alloc && !next_alloc) // Case 2
     {
+        remove_block(NEXT_BLKP(ptr));
         size += GET_SIZE(HDRP(NEXT_BLKP(ptr)));
         /* 여기서 이미 합쳐진 상태에서 HDRP랑 FTRP 사용 */
         PUT(HDRP(ptr), PACK(size, 0));
@@ -261,6 +310,7 @@ void *coalesce(void *ptr)
     }
     else if (!prev_alloc && next_alloc) // Case 3
     {
+        remove_block(PREV_BLKP(ptr));
         /* 앞 블록의 크기 */
         size += GET_SIZE(HDRP(PREV_BLKP(ptr)));
         /* 합쳐진 블록의 마지막 위치에 풋터를 새로 기록함 */
@@ -272,6 +322,8 @@ void *coalesce(void *ptr)
     }
     else
     {
+        remove_block(PREV_BLKP(ptr));
+        remove_block(NEXT_BLKP(ptr));
         /* 블록 두개 합친 것 */
         size += GET_SIZE(HDRP(PREV_BLKP(ptr))) + GET_SIZE(FTRP(NEXT_BLKP(ptr)));
         /* 이전 블록에 헤더에도 사이즈를 기록 */
@@ -284,9 +336,9 @@ void *coalesce(void *ptr)
         /* ptr을 이전 블록으로 옮김 */
         ptr = PREV_BLKP(ptr);
     }
+    insert_block(ptr);
     return ptr;
 }
-
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
@@ -308,7 +360,7 @@ void *mm_realloc(void *ptr, size_t size)
         return NULL;
     /* 옛 데이터 크기 읽기 - 지금의 블록 구조와 왜 안맞는 거지 */
     copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    printf("copySize = %zu, 헤더 크기 = %u\n", copySize, GET_SIZE(HDRP(oldptr)));
+    // printf("copySize = %zu, 헤더 크기 = %u\n", copySize, GET_SIZE(HDRP(oldptr)));
     /* 새 크기가 옜 데이터보다 작으면 (= 줄이는 경우)*/
     if (size < copySize)
         /* 새 블록에 들어가는 만큼만 복사 */
@@ -328,67 +380,138 @@ void *mm_realloc(void *ptr, size_t size)
 검사 항목: 1) 프롤로그 2) 정렬 3) 최소 크기 4) 헤더 = 풋터 5) 힙 범위
 6) 연속된 빈 블록 7) 에필로그)
 */
+/*
+ * mm_check - 힙과 가용 리스트를 훑으면서 일관성을 검사한다.
+ *   정상이면 1, 문제가 있으면 오류를 출력하고 0을 반환한다.
+ *   [힙 검사]    1) 프롤로그  2) 정렬  3) 최소 크기  4) 헤더 = 풋터
+ *               5) 힙 범위   6) 연속된 빈 블록  7) 에필로그  8) 겹치는 블록
+ *   [리스트 검사] 9) 리스트 블록이 free인가  10) SUCC가 힙 안인가
+ *               11) 앞뒤 연결  12) 고리 방지  13) 맨 앞 PRED == NULL
+ *               14) 힙의 빈 블록 수 == 리스트 블록 수
+ */
 int mm_check(void)
 {
     char *bp = heap_listp;
-    int ok = 1;        // 하나라도 실패하면 0으로 바꿈
+    int ok = 1;        // 하나라도 실패하면 0
     int prev_free = 0; // 바로 앞 블록이 빈 블록이었는지
+    int heap_free = 0; // 힙을 훑으며 센 빈 블록 수
+    int list_free = 0; // 리스트를 따라가며 센 블록 수
 
-    // 1) 프롤로그 : heap_listp 블록의 크기가 DSIZE, 할당 1인가?
+    // 1) 프롤로그: 크기 DSIZE, 할당 1
     if (GET_SIZE(HDRP(bp)) != DSIZE || !GET_ALLOC(HDRP(bp)))
     {
-        printf("프롤로그 블록이 정상이 아님\n");
+        printf("[mm_check] 프롤로그 오류\n");
         ok = 0;
     }
+
+    /* ===== 힙 순회: 모든 블록을 주소 순서대로 ===== */
     for (bp = NEXT_BLKP(heap_listp); GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
     {
-        // 2) 정렬 : 주소를 정수로 바꿔 8으로 나눈 나머지 -> (size_t)bp % ALIGNMENT
+        // 2) 정렬: bp가 8의 배수인가
         if ((size_t)bp % ALIGNMENT)
         {
-            printf("정렬 오류 : bp=%p\n", bp);
+            printf("[mm_check] 정렬 오류: bp=%p\n", bp);
             ok = 0;
         }
-        // 3) 크기: 8의 배수이고 16 이상인가?
-        if (GET_SIZE(HDRP(bp)) % ALIGNMENT || GET_SIZE(HDRP(bp)) <= 16)
+        // 3) 크기: 8의 배수이고 최소 블록 이상인가
+        if (GET_SIZE(HDRP(bp)) % ALIGNMENT || GET_SIZE(HDRP(bp)) < MINBLOCK)
         {
-            printf("크기 오류 : bp=%p, 크기=%u\n", bp, GET_SIZE(HDRP(bp)));
+            printf("[mm_check] 크기 오류: bp=%p, 크기=%u\n", bp, GET_SIZE(HDRP(bp)));
             ok = 0;
         }
-        // 4) 헤더 = 풋터: 헤더와 풋터가 같은가?
+        // 4) 헤더 == 풋터
         if (GET(HDRP(bp)) != GET(FTRP(bp)))
         {
-            printf("[mm_check] %p: 헤더(%u/%u) != 풋터(%u/%u)\n", bp,
+            printf("[mm_check] 헤더 != 풋터: bp=%p, 헤더=%u/%u, 풋터=%u/%u\n", bp,
                    GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)),
                    GET_SIZE(FTRP(bp)), GET_ALLOC(FTRP(bp)));
             ok = 0;
         }
-        // 5) 힙 범위 : bp가 mem_heap_lo()와 mem_heap_hi() 사이에 있는가?
-        if (bp < mem_heap_lo() || bp > mem_heap_hi())
+        // 5) 힙 범위 안인가
+        if ((void *)bp < mem_heap_lo() || (void *)bp > mem_heap_hi())
         {
-            printf("힙 범위 오류 : bp=%p, 힙 범위=[%p, %p]\n", bp, mem_heap_lo(), mem_heap_hi());
+            printf("[mm_check] 힙 범위 오류: bp=%p\n", bp);
             ok = 0;
         }
-        // 6) 연속된 빈 블록: 앞 블록도 비었고 지금 블록도 비었으면 오류
+        // 6) 연속된 빈 블록 (coalesce 빠뜨림)
         if (prev_free && !GET_ALLOC(HDRP(bp)))
         {
-            printf("연속된 빈 블록 오류 : bp=%p\n", bp);
+            printf("[mm_check] 연속된 빈 블록: bp=%p\n", bp);
             ok = 0;
         }
-        // 다음 블록을 위해 prev_free 갱신
         prev_free = !GET_ALLOC(HDRP(bp));
+
+        // 8) 겹침: 다음 블록은 반드시 나보다 뒤
+        if (NEXT_BLKP(bp) <= bp)
+        {
+            printf("[mm_check] 겹치는 블록: bp=%p, 다음=%p\n", bp, NEXT_BLKP(bp));
+            ok = 0;
+        }
+
+        // 빈 블록 개수 세기 (14번에서 리스트 개수와 비교)
+        if (!GET_ALLOC(HDRP(bp)))
+            heap_free++;
     }
-    // 7) 에필로그: 마지막 블록의 크기가 0이고 할당 1인가?
-    // 여기서 세그폴트 오류가 났음.
+
+    // 7) 에필로그: 루프가 끝난 bp = 에필로그, 크기 0 / 할당 1
     if (GET_SIZE(HDRP(bp)) != 0 || !GET_ALLOC(HDRP(bp)))
     {
-        printf("에필로그 블록 오류 : bp=%p, 헤더=%u/%u\n", bp, GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)));
+        printf("[mm_check] 에필로그 오류: bp=%p, 헤더=%u/%u\n",
+               bp, GET_SIZE(HDRP(bp)), GET_ALLOC(HDRP(bp)));
         ok = 0;
     }
-    // 8) 서로 겹치는 블록까지 다 다룸.
-    if ((char *)NEXT_BLKP(bp) <= bp)
+
+    /* 리스트 순회: 빈 블록만 SUCC로 따라감*/
+    for (bp = free_listp; bp != NULL; bp = SUCC(bp))
     {
-        printf("겹치는 블록 오류 : bp=%p, 다음 블록=%p\n", bp, NEXT_BLKP(bp));
+        list_free++;
+
+        // 9) 리스트에 있는 블록은 free여야 함 (place의 remove 빠뜨림)
+        if (GET_ALLOC(HDRP(bp)))
+        {
+            printf("[mm_check] 리스트에 할당 블록: bp=%p\n", bp);
+            ok = 0;
+        }
+
+        // 10) SUCC가 NULL이 아니면 힙 안을 가리켜야 함
+        if (SUCC(bp) != NULL &&
+            ((void *)SUCC(bp) < mem_heap_lo() || (void *)SUCC(bp) > mem_heap_hi()))
+        {
+            printf("[mm_check] SUCC가 힙 밖: bp=%p, SUCC=%p\n", bp, SUCC(bp));
+            ok = 0;
+            break; // 쓰레기 주소를 더 따라가면 세그폴트 → 멈춤
+        }
+
+        // 11) 앞뒤 연결: 내 뒤 블록의 PRED는 나여야 함
+        if (SUCC(bp) != NULL && PRED(SUCC(bp)) != bp)
+        {
+            printf("[mm_check] 연결 오류: bp=%p, SUCC=%p, SUCC의 PRED=%p\n",
+                   bp, SUCC(bp), PRED(SUCC(bp)));
+            ok = 0;
+        }
+
+        // 12) 고리 방지: 빈 블록 수보다 많이 셌으면 같은 블록을 또 지난 것
+        if (list_free > heap_free)
+        {
+            printf("[mm_check] 리스트에 고리가 있음 (list=%d, heap=%d)\n", list_free, heap_free);
+            ok = 0;
+            break; // 무한 루프 방지
+        }
+    }
+
+    // 13) 맨 앞 블록의 PRED는 NULL
+    if (free_listp != NULL && PRED(free_listp) != NULL)
+    {
+        printf("[mm_check] 맨 앞 블록의 PRED가 NULL이 아님: %p\n", PRED(free_listp));
         ok = 0;
     }
+
+    // 14) 힙의 빈 블록 수 == 리스트 블록 수 (insert/remove 빠뜨림)
+    if (heap_free != list_free)
+    {
+        printf("[mm_check] 빈 블록 수 불일치: 힙=%d, 리스트=%d\n", heap_free, list_free);
+        ok = 0;
+    }
+
     return ok;
 }
