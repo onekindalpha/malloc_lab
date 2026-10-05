@@ -43,7 +43,10 @@ team_t team = {
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7)
 
 /* Size_t하나를 저장하는데 필요한 공간을 8바이트 정렬 기준으로 계산한다.  */
-#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+// #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
+/* SIZE_T_SIZE는 8바이트 크기 칸이 몇 바이트인지 나타내던 매크로로, 지금은 헤더가 대신함.
+HDRP와 GET_SIZE 매크로로 대신하고 있음.
+*/
 
 /* ======기본 상수 ====== */
 #define WSIZE 4             // Word and header/footer size (bytes)
@@ -343,34 +346,68 @@ void *coalesce(void *ptr)
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
 /* ptr 크기를 바꿀 옛 블록의 주소(bp). size = 새로 원하는 크기 */
-
 void *mm_realloc(void *ptr, size_t size)
 {
-    /* 옛 블록을 알기 쉬운 이름으로 복사 */
-    void *oldptr = ptr;
-    /* 새 블록 주소를 담을 변수 */
-    void *newptr;
-    /* 옛 블록에서 새 블록으로 복사할 바이트 수*/
-    size_t copySize;
-    /* 새 크기로 새. ㅡㄹ. 로을 받음 (우리가 만든 mm_malloc 사용) */
-    newptr = mm_malloc(size);
-    /* 새 블록을 못 받았으면 */
-    if (newptr == NULL)
-        /* 실패를 알림. 옛 블록을 그대로 둠. */
+    /* 0. 예외 처리 */
+    if (ptr == NULL)
+        return mm_malloc(size);
+    if (size == 0)
+    {
+        mm_free(ptr);
         return NULL;
-    /* 옛 데이터 크기 읽기 - 지금의 블록 구조와 왜 안맞는 거지 */
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    // printf("copySize = %zu, 헤더 크기 = %u\n", copySize, GET_SIZE(HDRP(oldptr)));
-    /* 새 크기가 옜 데이터보다 작으면 (= 줄이는 경우)*/
-    if (size < copySize)
-        /* 새 블록에 들어가는 만큼만 복사 */
-        copySize = size;
-    /* oldptr에서 copysize바이트를 newptr로 복사*/
-    memcpy(newptr, oldptr, copySize);
-    /* 옜 블록 반납 (복사가 끝난 뒤에 )*/
-    mm_free(oldptr);
+    }
+    /* 1. 필요한 크기 계산 */
+    size_t asize;    // 새로 필요한 블록 크기 - 사이즈랑은 다름. 아마 헤더랑 풋터 제외해야 할 것.
+    size_t oldblock; // 지금 블록 전체 크기 - 사이즈랑은 다름. 아마
+    if (size <= DSIZE)
+        /* 최소블록 24*/
+        /* seglist에서는 다를 텐데. */
+        asize = MINBLOCK;
+    else
+        asize = DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE);
+    oldblock = GET_SIZE(HDRP(ptr));
+    /* 2. 제자리: 이미 충분히 큰 경우 */
+    if (oldblock >= asize)
+        return ptr;
+
+    /* 3. 제자리: 뒤 빈 블록과 합치는 경우 */
+    void *next = NEXT_BLKP(ptr);
+
+    /* 뒤가 에필로그면 힙을 늘려서 뒤에 빈 블록 만들기*/
+    if (GET_SIZE(HDRP(next)) == 0)
+    {
+        size_t need = asize - oldblock;
+        if (need < MINBLOCK)
+            ;
+        need = MINBLOCK;
+        if (extend_heap(need / WSIZE) == NULL)
+            return NULL;
+        next = NEXT_BLKP(ptr);
+    }
+    size_t nextsize = GET_SIZE(HDRP(next));
+    /* 현재 블록과 뒤 빈 블록과 합쳤을 때 큰 경우 */
+    if (!GET_ALLOC(HDRP(next)) && (oldblock + nextsize) >= asize)
+    {
+        /* TODO: 뒤 블록을 리스트에서 빼기 */
+        remove_block(next);
+        /* TODO: 내 헤더에 (합친 크기, 1) */
+        PUT(HDRP(ptr), PACK(oldblock + nextsize, 1));
+        /* TODO: 내 풋터에 (합친 크기, 1) */
+        PUT(FTRP(ptr), PACK(oldblock + nextsize, 1));
+        CHECKHEAP();
+        return ptr;
+    }
+    /*  4. 제자리로 안 되면: 새 블록 + 복사 + 반납 */
+    void *newptr = mm_malloc(size);
+    if (newptr == NULL)
+        return NULL;
+    size_t oldsize = oldblock - DSIZE;
+    size_t copysize = (size < oldsize) ? size : oldsize; /* TODO: size와 oldsize 중 작은 쪽 */
+
+    /* TODO: 옛 데이터를 새 블록으로 복사 */
+    memcpy(newptr, ptr, copysize);
+    mm_free(ptr);
     CHECKHEAP();
-    /* 새 블록 주소를 돌려줌. */
     return newptr;
 }
 
