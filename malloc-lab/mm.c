@@ -1,13 +1,43 @@
 /*
- * mm-naive.c - The fastest, least memory-efficient malloc package.
+ * mm.c - Explicit free list 기반 malloc 패키지
  *
- * In this naive approach, a block is allocated by simply incrementing
- * the brk pointer.  A block is pure payload. There are no headers or
- * footers.  Blocks are never coalesced or reused. Realloc is
- * implemented directly using mm_malloc and mm_free.
+ * [블록 구조]
+ *  할당 블록:
+ *   +--------+---------------------------+--------+
+ *   | header |         payload           | footer |
+ *   | size|1 |                           | size|1 |
+ *   +--------+---------------------------+--------+
+ *     4B                                    4B
  *
- * NOTE TO STUDENTS: Replace this header comment with your own header
- * comment that gives a high level description of your solution.
+ *  가용 블록:
+ *   +--------+--------+--------+---------+--------+
+ *   | header |  PRED  |  SUCC  |  (빈칸) | footer |
+ *   | size|0 |  8B    |  8B    |         | size|0 |
+ *   +--------+--------+--------+---------+--------+
+ *   -> 최소 블록 크기 MINBLOCK = 4 + 8 + 8 + 4 = 24B
+ *
+ *  - header/footer 하위 비트: bit0 = 할당 여부
+ *  - 모든 블록은 8바이트 정렬
+ *
+ * [힙 구조]
+ *  | pad | prologue(8/1) | prologue(8/1) | 블록들 ... | epilogue(0/1) |
+ *
+ * [가용 리스트 관리]
+ *  - 이중 연결 리스트 (PRED/SUCC 포인터를 가용 블록 payload에 저장)
+ *  - 삽입: LIFO (free_listp 맨 앞에 삽입)
+ *  - 탐색: first fit (free_listp부터 SUCC를 따라감)
+ *  - free 시 coalesce로 앞뒤 가용 블록과 즉시 병합
+ *
+ * [배치 정책]
+ *  - 남는 공간 >= MINBLOCK 이면 분할
+ *  - 요청 크기 < PLACE_THRESHOLD(96): 블록 앞쪽에 배치
+ *    요청 크기 >= PLACE_THRESHOLD   : 블록 뒤쪽에 배치 (단편화 감소)
+ *
+ * [realloc]
+ *  - 새 크기가 현재 블록에 들어가면 그대로 반환
+ *  - 다음 블록이 epilogue이면 힙을 확장해서 제자리 확장
+ *  - 다음 블록이 가용이고 합쳐서 충분하면 제자리 확장
+ *  - 그 외: malloc → memcpy → free
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -76,10 +106,18 @@ HDRP와 GET_SIZE 매크로로 대신하고 있음.
 #define SUCC(bp) (*(char **)((char *)(bp) + DSIZE)) /* bp +8 위치의 8바이트 =. ㅟ 블록 주소 */
 #define PLACE_THRESHOLD 64
 
+/* 리스트 개수 추가 - 크기별 리스트를 12개 두겠다. */
+#define LISTNUM 12
+/* 추가: i번 리스트 Head읽기 쓰기 매크로
+seg_listp + i * 8 위치에 있는 8바이트 포인터.
+*/
+#define HEAD(i) (*(char **)(seg_listp + (i) * DSIZE))
 /* 전역변수를 많이 쓰지 말라고 함. 아래 정도면 괜찮겠지 */
 
 static char *heap_listp; // Pointer to first block
-static char *free_listp; //
+// static char *free_listp; //
+/* head 배열(힙 안)의 시작 주소*/
+static char *seg_listp;
 
 static void *extend_heap(size_t words);
 static void *find_fit(size_t asize);
@@ -87,11 +125,13 @@ static void *coalesce(void *bp);
 static void *place(void *bp, size_t asize);
 static void remove_block(void *bp);
 static void insert_block(void *bp);
+/*추가: Get_class 프로토타입*/
+static int get_class(size_t size);
 
 int mm_check(void);
 
 // #define DEBUG // "DEBUG라는 이름이 존재한다"고 표시만 함 (값은 없음)
-//  이 줄을 주석 처리하면 → DEBUG가 없는 상태
+//   이 줄을 주석 처리하면 → DEBUG가 없는 상태
 
 #ifdef DEBUG // 만약 DEBUG가 존재하면 (= 검사 켜짐)
 #define CHECKHEAP()                            \
@@ -115,14 +155,27 @@ int mm_check(void);
 int mm_init(void)
 {
     /* Create the initial empty heap */
-    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
+    /* head 12칸 (12*8바이트)과 기존 4워드 한번에 받아서 그 시작 주소를 seg_listp에 저장하겠다. */
+    if ((seg_listp = mem_sbrk(LISTNUM * DSIZE + 4 * WSIZE)) == (void *)-1)
         return -1;
-    PUT(heap_listp, 0);                            // Alignment padding
+    /* 12개 리스트가 모두 비어있도록 head를 전부 NULL로 만들겠다.
+    extend_heap안에서 insert_blocK이 불리기 때문에
+    반드시 그 전에 해야 한다.
+    */
+    for (int i = 0; i < LISTNUM; i++)
+    {
+        HEAD(i) = NULL;
+    }
+    /*기존 힙 구조는 Head칸 바로 뒤에서 시작하게 하겠다. */
+    heap_listp = seg_listp + (LISTNUM * DSIZE);
+
+    PUT(heap_listp, 0);                            //
     PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1)); // Prologue header
     PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); // Prologue footer
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     // Epilogue header
     heap_listp += (2 * WSIZE);
-    free_listp = NULL; // for seglist
+
+    // free_listp = NULL; // for seglist
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
         return -1;
@@ -156,20 +209,39 @@ static void *extend_heap(size_t words)
     return coalesce(bp);
 }
 
+/*get_class 블록 크기가 속하는 리스트 번호를 반환.
+ */
+static int get_class(size_t size)
+{
+    int i = 0;
+    size_t limit = 32;
+    // 크기 상한을 사용하면 됨.
+    /* 크기가 지금 상한보다 크고 아직 마지막 리스트가 아니면,
+    다음 리스트로 넘어가면서 상한을 2배로 늘리겠다. */
+    while (size > limit && i < LISTNUM - 1)
+    {
+        i++;
+        limit = limit * 2;
+    }
+    return i;
+}
 /* static find_fit */
 static void *find_fit(size_t asize)
 {
     /* First Fit Search*/
     void *bp;
-    /* 현재 헤더에서 읽힌 크기가 0보다 클 동안 다음 블록으로 이동한다. */
-    for (bp = free_listp; bp != NULL; bp = SUCC(bp))
-    {
-        // 할당여부는 검사할 필요가 없음.
-        if (asize <= GET_SIZE(HDRP(bp)))
+    /* asize(요청 크기)가 속한 리스트부터 시작해서, 거기서 못 찾으면 더 큰 리스트로 넘어가며
+    찾겠습니다. 그보다 작은 리스트에는 요청보다 작은 블록만 있으니 볼 필요가 없음*/
+    for (int i = get_class(asize); i < LISTNUM; i++)
+        /* 현재 헤더에서 읽힌 크기가 0보다 클 동안 다음 블록으로 이동한다. */
+        for (bp = HEAD(i); bp != NULL; bp = SUCC(bp))
         {
-            return bp;
+            // 할당여부는 검사할 필요가 없음.
+            if (asize <= GET_SIZE(HDRP(bp)))
+            {
+                return bp;
+            }
         }
-    }
     // 여기서 널을 반환하면 Mm_malloc에서 검사를 해서 알맞은 공간이 없으면 extend_heap을 한다.
     return NULL;
 }
@@ -177,14 +249,15 @@ static void *find_fit(size_t asize)
 /* static seglist의 remove block*/
 static void remove_block(void *bp)
 {
-
-    /*일단 세개의 케이스를 나눠서 지운다. */
+    /* 이 블록이 몇 번 리스트에 들어있는지 크기로 알아내겠다 */
+    int i = get_class(GET_SIZE(HDRP(bp)));
+    /* 일단 세개의 케이스를 나눠서 지운다. */
     /* 일단 내 앞이 있으면 */
     if (PRED(bp) != NULL)
         SUCC(PRED(bp)) = SUCC(bp);
     /* 맨 앞이 나일때*/
     else
-        free_listp = SUCC(bp);
+        HEAD(i) = SUCC(bp);
     /* 일단 내 뒤가 있으면 */
     if (SUCC(bp) != NULL)
         PRED(SUCC(bp)) = PRED(bp);
@@ -193,16 +266,15 @@ static void remove_block(void *bp)
 /* static seglist의 insert block*/
 static void insert_block(void *bp)
 {
-    /* 프리리스트 관리할때 맨 앞에 넣어서 관리를 함. 그게 편하기 때문임.*/
-    /* 처음에 아예 프리리스트가 비어있다고 생각을 하고 구현을 함 */
-    /* 내 뒤와 앞을 정한다. */
-    SUCC(bp) = free_listp;
+    /*이 블록의 헤더 크기를 보고 몇 번 리스트에 넣을 지 정한다. */
+    int i = get_class(GET_SIZE(HDRP(bp)));
+    SUCC(bp) = HEAD(i);
     PRED(bp) = NULL;
-    if (free_listp != NULL)
+    if (HEAD(i) != NULL)
     {
-        PRED(free_listp) = bp;
+        PRED(HEAD(i)) = bp;
     }
-    free_listp = bp;
+    HEAD(i) = bp;
 }
 
 /* static seglist의 place */
@@ -320,7 +392,16 @@ void mm_free(void *ptr)
     coalesce(ptr);
     CHECKHEAP();
 }
-
+/*
+ * coalesce - bp 앞뒤 블록이 가용이면 병합한다.
+ *   case 1: 앞(할당) 뒤(할당) -> 병합 없음
+ *   case 2: 앞(할당) 뒤(가용) -> 뒤와 병합
+ *   case 3: 앞(가용) 뒤(할당) -> 앞과 병합
+ *   case 4: 앞(가용) 뒤(가용) -> 셋 다 병합
+ *   병합 전 이웃은 remove_block으로 리스트에서 빼고,
+ *   결과 블록을 insert_block으로 리스트 맨 앞에 넣는다.
+ *   반환: 병합된 블록의 bp
+ */
 void *coalesce(void *ptr)
 {
     size_t prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(ptr)));
@@ -405,8 +486,7 @@ void *mm_realloc(void *ptr, size_t size)
     {
         size_t need = asize - oldblock;
         if (need < MINBLOCK)
-            ;
-        need = MINBLOCK;
+            need = MINBLOCK;
         if (extend_heap(need / WSIZE) == NULL)
             return NULL;
         next = NEXT_BLKP(ptr);
@@ -439,19 +519,49 @@ void *mm_realloc(void *ptr, size_t size)
 }
 
 /*
-* mm_check - 힙을 처음부터 끝까지 훑으면서 일관성을 검사한다.
-힙이 정상이면 1(0이 아닌 값), 문제가 있으면 오류를 출력하고 0을 반환한다.
-검사 항목: 1) 프롤로그 2) 정렬 3) 최소 크기 4) 헤더 = 풋터 5) 힙 범위
-6) 연속된 빈 블록 7) 에필로그)
-*/
+ * mm_check - 힙과 가용 리스트의 일관성 검사. 문제가 있으면 0 반환.
+ *
+ * [힙 검사]
+ *  1. prologue 헤더가 DSIZE/할당 상태인가
+ *  2. 모든 블록 bp가 8바이트 정렬인가
+ *  3. header와 footer가 일치하는가
+ *  4. 블록 크기 >= MINBLOCK 인가
+ *  5. 연속된 가용 블록이 없는가 (coalesce 누락 탐지)
+ *  6. 블록이 힙 범위 안에 있는가
+ *  7. 블록끼리 겹치지 않는가
+ *  8. epilogue가 0/1 인가
+ * [리스트 검사]
+ *  9.  리스트의 모든 블록이 가용 상태인가
+ *  10. 리스트 포인터가 힙 범위 안을 가리키는가
+ *  11. PRED/SUCC 양방향 연결이 일치하는가
+ *  12. 첫 노드의 PRED가 NULL인가
+ *  13. 힙의 가용 블록 수 == 리스트 노드 수 인가
+ *  14. 리스트에 사이클이 없는가
+ *
+ *  사용법: #define DEBUG 켜면 CHECKHEAP()이 매 연산 후 호출됨
+ */
 /*
- * mm_check - 힙과 가용 리스트를 훑으면서 일관성을 검사한다.
- *   정상이면 1, 문제가 있으면 오류를 출력하고 0을 반환한다.
- *   [힙 검사]    1) 프롤로그  2) 정렬  3) 최소 크기  4) 헤더 = 풋터
- *               5) 힙 범위   6) 연속된 빈 블록  7) 에필로그  8) 겹치는 블록
- *   [리스트 검사] 9) 리스트 블록이 free인가  10) SUCC가 힙 안인가
- *               11) 앞뒤 연결  12) 고리 방지  13) 맨 앞 PRED == NULL
- *               14) 힙의 빈 블록 수 == 리스트 블록 수
+ * mm_check - 힙과 가용 리스트의 일관성 검사. 문제가 있으면 0 반환.
+ *
+ * [힙 검사] - 힙을 주소 순서대로 한 번 훑는다
+ *  1. prologue 헤더가 DSIZE/할당 상태인가
+ *  2. 모든 블록 bp가 8바이트 정렬인가
+ *  3. 블록 크기가 8의 배수이고 MINBLOCK 이상인가
+ *  4. header와 footer가 일치하는가
+ *  5. 블록이 힙 범위 안에 있는가
+ *  6. 연속된 가용 블록이 없는가 (coalesce 누락 탐지)
+ *  7. epilogue가 0/1 인가
+ *  8. 블록끼리 겹치지 않는가
+ * [리스트 검사] - 12개 크기별 리스트를 각각 훑는다
+ *  9.  리스트의 모든 블록이 가용 상태인가
+ *  10. SUCC가 힙 범위 안을 가리키는가
+ *  11. PRED/SUCC 양방향 연결이 일치하는가
+ *  12. 리스트에 고리(사이클)가 없는가
+ *  13. 각 리스트 첫 블록의 PRED가 NULL인가
+ *  14. 힙의 가용 블록 수 == 전체 리스트 블록 수 인가
+ *  15. 각 블록이 자기 크기에 맞는 리스트에 있는가
+ *
+ *  사용법: #define DEBUG 켜면 CHECKHEAP()이 매 연산 후 호출됨
  */
 int mm_check(void)
 {
@@ -468,7 +578,7 @@ int mm_check(void)
         ok = 0;
     }
 
-    /* ===== 힙 순회: 모든 블록을 주소 순서대로 ===== */
+    /* ===== ① 힙 순회: 모든 블록을 주소 순서대로 한 번 ===== */
     for (bp = NEXT_BLKP(heap_listp); GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp))
     {
         // 2) 정렬: bp가 8의 배수인가
@@ -525,52 +635,65 @@ int mm_check(void)
         ok = 0;
     }
 
-    /* 리스트 순회: 빈 블록만 SUCC로 따라감*/
-    for (bp = free_listp; bp != NULL; bp = SUCC(bp))
+    /* ===== ② 리스트 순회: 0번부터 11번 리스트까지 하나씩 ===== */
+    for (int i = 0; i < LISTNUM; i++)
     {
-        list_free++;
-
-        // 9) 리스트에 있는 블록은 free여야 함 (place의 remove 빠뜨림)
-        if (GET_ALLOC(HDRP(bp)))
+        // 13) 각 리스트의 맨 앞 블록은 PRED가 NULL이어야 한다
+        if (HEAD(i) != NULL && PRED(HEAD(i)) != NULL)
         {
-            printf("[mm_check] 리스트에 할당 블록: bp=%p\n", bp);
+            printf("[mm_check] %d번 리스트 맨 앞의 PRED가 NULL이 아님: %p\n", i, PRED(HEAD(i)));
             ok = 0;
         }
 
-        // 10) SUCC가 NULL이 아니면 힙 안을 가리켜야 함
-        if (SUCC(bp) != NULL &&
-            ((void *)SUCC(bp) < mem_heap_lo() || (void *)SUCC(bp) > mem_heap_hi()))
+        /* i번 리스트 안의 블록을 SUCC로 하나씩 따라가며 검사 */
+        for (bp = HEAD(i); bp != NULL; bp = SUCC(bp))
         {
-            printf("[mm_check] SUCC가 힙 밖: bp=%p, SUCC=%p\n", bp, SUCC(bp));
-            ok = 0;
-            break; // 쓰레기 주소를 더 따라가면 세그폴트 → 멈춤
-        }
+            list_free++;
 
-        // 11) 앞뒤 연결: 내 뒤 블록의 PRED는 나여야 함
-        if (SUCC(bp) != NULL && PRED(SUCC(bp)) != bp)
-        {
-            printf("[mm_check] 연결 오류: bp=%p, SUCC=%p, SUCC의 PRED=%p\n",
-                   bp, SUCC(bp), PRED(SUCC(bp)));
-            ok = 0;
-        }
+            // 9) 리스트에 있는 블록은 가용이어야 한다 (place의 remove 빠뜨림)
+            if (GET_ALLOC(HDRP(bp)))
+            {
+                printf("[mm_check] 리스트에 할당 블록: bp=%p\n", bp);
+                ok = 0;
+            }
 
-        // 12) 고리 방지: 빈 블록 수보다 많이 셌으면 같은 블록을 또 지난 것
-        if (list_free > heap_free)
-        {
-            printf("[mm_check] 리스트에 고리가 있음 (list=%d, heap=%d)\n", list_free, heap_free);
-            ok = 0;
-            break; // 무한 루프 방지
-        }
-    }
+            // 10) SUCC가 NULL이 아니면 힙 안을 가리켜야 한다
+            if (SUCC(bp) != NULL &&
+                ((void *)SUCC(bp) < mem_heap_lo() || (void *)SUCC(bp) > mem_heap_hi()))
+            {
+                printf("[mm_check] SUCC가 힙 밖: bp=%p, SUCC=%p\n", bp, SUCC(bp));
+                ok = 0;
+                break; // 쓰레기 주소를 더 따라가면 세그폴트 → 이 리스트 검사 중단
+            }
 
-    // 13) 맨 앞 블록의 PRED는 NULL
-    if (free_listp != NULL && PRED(free_listp) != NULL)
-    {
-        printf("[mm_check] 맨 앞 블록의 PRED가 NULL이 아님: %p\n", PRED(free_listp));
-        ok = 0;
-    }
+            // 11) 내 뒤 블록의 PRED는 나여야 한다
+            if (SUCC(bp) != NULL && PRED(SUCC(bp)) != bp)
+            {
+                printf("[mm_check] 연결 오류: bp=%p, SUCC=%p, SUCC의 PRED=%p\n",
+                       bp, SUCC(bp), PRED(SUCC(bp)));
+                ok = 0;
+            }
 
-    // 14) 힙의 빈 블록 수 == 리스트 블록 수 (insert/remove 빠뜨림)
+            // 12) 고리 방지: 힙의 빈 블록 수보다 많이 셌으면 같은 블록을 또 지난 것
+            if (list_free > heap_free)
+            {
+                printf("[mm_check] 리스트에 고리가 있음 (list=%d, heap=%d)\n", list_free, heap_free);
+                ok = 0;
+                break; // 무한 루프 방지
+            }
+
+            // 15) 블록 크기로 구한 리스트 번호가 지금 리스트(i)와 같아야 한다
+            if (get_class(GET_SIZE(HDRP(bp))) != i)
+            {
+                printf("[mm_check] 잘못된 리스트: bp=%p, 크기=%u, 있는 곳=%d, 있어야 할 곳=%d\n",
+                       bp, GET_SIZE(HDRP(bp)), i, get_class(GET_SIZE(HDRP(bp))));
+                ok = 0;
+            }
+        } // 안쪽 for 끝: i번 리스트 다 봄
+    } // 바깥 for 끝: 12개 리스트 다 봄
+
+    /* ===== ③ 마무리: 모든 for 밖 ===== */
+    // 14) 힙에서 센 빈 블록 수 == 12개 리스트에서 센 블록 수
     if (heap_free != list_free)
     {
         printf("[mm_check] 빈 블록 수 불일치: 힙=%d, 리스트=%d\n", heap_free, list_free);
