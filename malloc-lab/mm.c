@@ -49,9 +49,9 @@ HDRP와 GET_SIZE 매크로로 대신하고 있음.
 */
 
 /* ======기본 상수 ====== */
-#define WSIZE 4             // Word and header/footer size (bytes)
-#define DSIZE 8             // Double word size (bytes)
-#define CHUNKSIZE (1 << 12) // Extend heap by this amount (bytes
+#define WSIZE 4            // Word and header/footer size (bytes)
+#define DSIZE 8            // Double word size (bytes)
+#define CHUNKSIZE (1 << 8) // Extend heap by this amount (bytes
 
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
@@ -74,6 +74,7 @@ HDRP와 GET_SIZE 매크로로 대신하고 있음.
 #define MINBLOCK 24
 #define PRED(bp) (*(char **)(bp))                   /* bp 위치의 8바이트 = 앞 블록 주소 */
 #define SUCC(bp) (*(char **)((char *)(bp) + DSIZE)) /* bp +8 위치의 8바이트 =. ㅟ 블록 주소 */
+#define PLACE_THRESHOLD 64
 
 /* 전역변수를 많이 쓰지 말라고 함. 아래 정도면 괜찮겠지 */
 
@@ -83,7 +84,7 @@ static char *free_listp; //
 static void *extend_heap(size_t words);
 static void *find_fit(size_t asize);
 static void *coalesce(void *bp);
-static void place(void *bp, size_t asize);
+static void *place(void *bp, size_t asize);
 static void remove_block(void *bp);
 static void insert_block(void *bp);
 
@@ -205,27 +206,53 @@ static void insert_block(void *bp)
 }
 
 /* static seglist의 place */
-static void place(void *bp, size_t asize)
+static void *place(void *bp, size_t asize)
 {
     size_t csize = GET_SIZE(HDRP(bp)); // 현재 블록의 크기
-
     /* 지금 프리리스트로 빼는 애를 remove를 먼저 한다. */
     remove_block(bp);
-    /* 그 다음에 insert를 진행을 한다. */
+    /* 분할을 하는 경우 */
     if ((csize - asize) >= (MINBLOCK))
     {
-        // 현재 블록 크기에서 요청한 크기를 뺀 것이 최소 블록 이상이면
-        PUT(HDRP(bp), PACK(asize, 1)); // 현재 블록 헤더를 요청한 크기로 바꾼다.
-        PUT(FTRP(bp), PACK(asize, 1)); // 현재 블록 풋터를 요청한 크기로 바꾼다.
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize - asize, 0)); // 다음 블록 헤더를 남는 크기로 바꾼다.
-        PUT(FTRP(bp), PACK(csize - asize, 0)); // 다음 블록 풋터를 남는 크기로 바꾼다.
-        insert_block(bp);                      // insert_block을 진행을 한다.
+        // 작은 요청: 앞쪽 할당, 뒤쪽 빈 조각 //
+        if (asize < PLACE_THRESHOLD)
+        {
+            // 작은 요청: 할당한 것이 앞에 오는 경우.
+            void *alloc = bp;
+            // 현재 블록 크기에서 요청한 크기를 뺀 것이 최소 블록 이상이면
+            PUT(HDRP(bp), PACK(asize, 1)); // 현재 블록 헤더를 요청한 크기로 바꾼다.
+            PUT(FTRP(bp), PACK(asize, 1)); // 현재 블록 풋터를 요청한 크기로 바꾼다.
+            // 다음 블록으로 이동한다.
+            bp = NEXT_BLKP(bp);
+            PUT(HDRP(bp), PACK(csize - asize, 0)); // 다음 블록 헤더를 남는 크기로 바꾼다.
+            PUT(FTRP(bp), PACK(csize - asize, 0)); // 다음 블록 풋터를 남는 크기로 바꾼다.
+            // 뒤쪽 조각을 리스트에 넣기
+            insert_block(bp); // insert_block을 진행을 한다.
+            return alloc;
+        }
+        else
+        {
+            // 새 방식: 앞쪽 빈 조각, 뒤쪽 할당 //
+            // 앞쪽 헤더 풋터
+            PUT(HDRP(bp), PACK(csize - asize, 0));
+            PUT(FTRP(bp), PACK(csize - asize, 0));
+            // 앞쪽 조각을 리스트에 넣기
+            insert_block(bp);
+            // bp를 뒤쪽으로 이동
+            bp = NEXT_BLKP(bp);
+            // 뒤쪽 헤더, 풋터 정의하기
+            PUT(HDRP(bp), PACK(asize, 1));
+            PUT(FTRP(bp), PACK(asize, 1));
+            // 뒤쪽 블록이 할당 블록
+            return bp;
+        }
     }
+    // 분할 안하는 경우 //
     else
     {
-        PUT(HDRP(bp), PACK(csize, 1)); //
+        PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
+        return bp;
     }
 }
 /*
@@ -250,7 +277,7 @@ void *mm_malloc(size_t size)
     if ((bp = find_fit(asize)) != NULL)
     {
         /* 찾았으면 그 자리에 배치 */
-        place(bp, asize);
+        bp = place(bp, asize);
         CHECKHEAP();
         /* 반환*/
         return bp;
@@ -261,7 +288,7 @@ void *mm_malloc(size_t size)
         /* 힙도 못 늘리면 실패다. */
         return NULL;
     /* 새로 생긴 빈 블록에 배치. */
-    place(bp, asize);
+    bp = place(bp, asize);
     CHECKHEAP();
     return bp;
 }
