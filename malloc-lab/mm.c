@@ -74,7 +74,7 @@ HDRP와 GET_SIZE 매크로로 대신하고 있음.
 #define MINBLOCK 24
 #define PRED(bp) (*(char **)(bp))                   /* bp 위치의 8바이트 = 앞 블록 주소 */
 #define SUCC(bp) (*(char **)((char *)(bp) + DSIZE)) /* bp +8 위치의 8바이트 =. ㅟ 블록 주소 */
-#define PLACE_THRESHOLD 96
+#define PLACE_THRESHOLD 64
 
 /* 전역변수를 많이 쓰지 말라고 함. 아래 정도면 괜찮겠지 */
 
