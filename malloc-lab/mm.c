@@ -128,7 +128,7 @@ static free_block_t *rover[LISTNUM];
 /* 기본 상수 */
 #define WSIZE 4            // Word and header/footer size (bytes)
 #define DSIZE 8            // Double word size (bytes)
-#define CHUNKSIZE (1 << 13) // 힙 확장 기본 크기
+#define CHUNKSIZE (1 << 8) // 힙 확장 기본 크기
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 #define PACK(size, alloc) ((size) | (alloc))                            // Pack a size and allocated bit into a word
 #define GET(p) (*(unsigned int *)(p))                                   // Read a word at address p
