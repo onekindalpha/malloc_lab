@@ -27,9 +27,10 @@
  * =================================================================================
  * [seg_listp]
  *   │
- *   ├── HEAD(0)  ~ HEAD(11) : 크기 클래스별 가용 리스트 헤더 포인터 배열 (12 * 8B = 96B)
+ *   ├── HEAD(0)  ~ HEAD(15) : 크기 클래스별 가용 리스트의 시작 주소 칸 (16 * 8B = 128B)
+ *   │                         전역 배열이 금지라서 배열 변수가 아니라 힙 맨 앞의 칸으로 둔다.
  *   │
- * [heap_listp] (seg_listp + 96B)
+ * [heap_listp] (seg_listp + 128B)
  *   │
  *   ├── Alignment Padding  (4Bytes) : 8바이트 정렬을 맞추기 위한 패딩 (값: 0)
  *   ├── Prologue Header    (4Bytes) : 힙 시작 경계 표시 (크기: 8B, alloc: 1)
@@ -38,12 +39,15 @@
  *   │
  *   └── [실제 할당/가용 데이터 블록들이 위치하는 공간]
  *
+ * - seg_listp, heap_listp는 함수 밖의 static 전역 포인터라 데이터 영역에 있다.
+ *   (배열이 아닌 포인터 변수 하나라 과제 규칙상 허용)
+ *
  * =================================================================================
  * 3. 가용 리스트 구성 및 관리 방식 (Segregated Free List)
  * =================================================================================
- * - 크기 범주(Class)별로 독립된 12개의 명시적 이중 연결 리스트(Explicit Doubly Linked List)를 운영합니다.
- * - get_class(size) 함수를 통해 블록 크기에 해당하는 클래스 인덱스(0 ~ 11)를 결정합니다.
- *   (예: <=32B: 0, <=64B: 1, <=128B: 2, ... , >32768B: 11)
+ * - 크기 범주(Class)별로 독립된 16개의 명시적 이중 연결 리스트(Explicit Doubly Linked List)를 운영합니다.
+ * - get_class(size) 함수를 통해 블록 크기에 해당하는 클래스 인덱스(0 ~ 15)를 결정합니다.
+ *   (예: <=24B: 0, <=32B: 1, <=48B: 2, <=64B: 3, <=96B: 4, <=128B: 5, ... , >32768B: 15)
  *
  * [가용 리스트 조작 방식]
  *  ① 삽입 (insert_block):
@@ -56,21 +60,29 @@
  *
  *  ③ 탐색 및 배치 (find_fit & place):
  *     - 요청된 크기(asize)의 클래스 인덱스부터 시작하여 상위 클래스 방향으로 탐색합니다.
- *     - 핏 정책: FIRST_FIT, NEXT_FIT, BEST_FIT 선택 가능 (기본값: FIRST_FIT).
+ *     - 핏 정책: FIRST_FIT, BEST_FIT 선택 가능 (기본값: FIRST_FIT).
+ *       NEXT_FIT은 실험해 보았으나 크기별 리스트에서 이점이 없어 제외했습니다.
  *     - 할당 시 분할(Splitting):
  *       - 잔여 공간이 MINBLOCK(24B) 이상이면 블록을 분할합니다.
  *       - 단편화 최적화: 요청 크기가 PLACE_THRESHOLD(64B) 미만이면 앞쪽 할당/뒤쪽 가용,
  *         이상이면 앞쪽 가용/뒤쪽 할당 방식으로 배치합니다.
+ *         (남는 빈 조각을 앞에 두어, 큰 블록끼리 힙 끝 쪽에 모이게 한다 → 외부 단편화 감소)
  *
  *  ④ 병합 (coalesce):
  *     - mm_free 또는 extend_heap 시 인접한 앞/뒤 블록의 가용 여부(GET_ALLOC)를 확인합니다.
  *     - 인접한 가용 블록이 존재하면 remove_block으로 기존 가용 블록을 리스트에서 제거한 후,
  *       하나의 큰 블록으로 합쳐 새로운 가용 블록을 생성하고 insert_block으로 재삽입합니다.
  *
- *  ⑤ 재할당 (mm_realloc):
+ *  ⑤ 할당 크기와 힙 확장 (mm_malloc):
+ *     - 요청 크기가 256B 이상이고 2^k의 7/8 이상이면 2^k로 올려 받는다.
+ *       (나중에 조금 더 큰 요청이 와도 그 자리를 재사용할 수 있게)
+ *     - 작은 요청(64B 미만) 때문에 힙을 늘릴 때는 4KB를 한 번에 받아,
+ *       작은 블록끼리 모이고 큰 블록 사이에 끼지 않게 한다.
+ *
+ *  ⑥ 재할당 (mm_realloc):
  *     - 현재 블록으로 크기 충족 시: 그대로 반환
- *     - 다음 인접 블록이 가용 블록이고 합쳐서 크기가 충족되는 경우: 제자리 확장 (In-place expansion)
  *     - 다음 블록이 에필로그인 경우: 힙을 필요한 만큼만 확장하여 제자리 확장
+ *     - 다음 인접 블록이 가용 블록이고 합쳐서 크기가 충족되는 경우: 분할 없이 통째로 흡수 (In-place expansion)
  *     - 위 조건 불가 시: mm_malloc -> memcpy -> mm_free 수행
  * =================================================================================
  */
@@ -110,15 +122,13 @@ typedef struct free_block
 typedef enum
 {
     FIRST_FIT,
-    NEXT_FIT,
+    // NEXT_FIT,
     BEST_FIT
 } fit_type_t;
 /* 실행할 핏 정책 선택 */
-static fit_type_t current_fit_mode = FIRST_FIT;
-/* 리스트 개수 추가 - 크기별 리스트를 12개 두겠다. */
-#define LISTNUM 16
-/* 넥스트 핏을 위해 마지막으로 할당한 위치를 클래스별로 저장하는 배열 */
-static free_block_t *rover[LISTNUM];
+static fit_type_t current_fit_mode = BEST_FIT;
+/* 리스트 개수 - 크기별 리스트를 16개 두겠다. */
+#define LISTNUM 8
 /* single word (4) or double word (8) alignment */
 /* 정렬 기준을 8바이트로 정함.  */
 #define ALIGNMENT 8
@@ -141,14 +151,17 @@ static free_block_t *rover[LISTNUM];
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE))) // Given block ptr bp, compute address of previous block
 /* 최소 블록 크기 24 */
 #define MINBLOCK 24
-#define PLACE_THRESHOLD 64
+/* place에서 앞/뒤 배치를 가르는 기준 (이 크기 미만이면 앞쪽에 할당) */
+#define PLACE_THRESHOLD 170
+/* 작은 요청 때문에 힙을 늘릴 때 한 번에 받을 크기 */
+#define SMALL_CHUNKSIZE (1 << 12)
 /* 크기 클래스별로 리스트 헤드가 여러 개 필요함. */
 /* 가용 블록의 주소가 저장된 곳으로 가서 그 값을 꺼내라는 말. */
 #define HEAD(i) (*(free_block_t **)(seg_listp + (i) * DSIZE))
-/* 전역변수를 많이 쓰지 말라고 함. 아래 정도면 괜찮겠지 */
+/* 전역 포인터 두 개 (함수 밖 static → 데이터 영역, 배열이 아니라 허용) */
 /* 실제 힙 블록들의 시작 주소/ 프롤로그 블록 */
 static char *heap_listp;
-/* 12개 리스트의 1등(Head) 주소록을 힙 맨 앞에 일렬로 모아둔 시작 위치 */
+/* 16개 리스트의 시작 주소 칸(HEAD)을 힙 맨 앞에 일렬로 모아둔 시작 위치 */
 static char *seg_listp;
 
 /* 함수 프로토타입 */
@@ -158,7 +171,6 @@ static void *coalesce(void *bp);
 static void *place(void *bp, size_t asize);
 static void remove_block(void *bp);
 static void insert_block(void *bp);
-/*추가: Get_class 프로토타입*/
 static int get_class(size_t size);
 
 int mm_check(void);
@@ -183,62 +195,63 @@ int mm_check(void);
 #endif              // 조건 끝
 
 /*
- * mm_init - initialize the malloc package.
+ * mm_init - 힙을 처음 만들고 HEAD 칸, 프롤로그, 에필로그를 세운 뒤 첫 가용 블록을 만든다.
  *
  * [힙 초기화 메모리 배치 구조]
  * [0번지] ─── seg_listp 가 가리키는 곳
  *   │
  *   ├── HEAD(0)  (8B) ┐
- *   ├── HEAD(1)  (8B) │  <-- 12개 가용 리스트의 시작 포인터 보관함
- *   │   ...           │      (총 96바이트 = LISTNUM * DSIZE)
- *   └── HEAD(11) (8B) ┘
+ *   ├── HEAD(1)  (8B) │  <-- 16개 가용 리스트의 시작 포인터 보관함
+ *   │   ...           │      (총 128바이트 = LISTNUM * DSIZE)
+ *   └── HEAD(15) (8B) ┘
  *   │
- * [96번지] ── heap_listp 가 가리키는 곳 (seg_listp + 96)
+ * [128번지] ── heap_listp 가 처음 가리키는 곳 (seg_listp + 128)
  *   │
  *   ├── Alignment Padding (4B)  ┐
  *   ├── Prologue Header   (4B)  ├─ 힙 시작 및 끝 경계 표시용 기초 블록
  *   ├── Prologue Footer   (4B)  │  (총 16바이트 = 4 * WSIZE)
  *   └── Epilogue Header   (4B)  ┘
  *   │
- * [112번지] ── 실제 malloc으로 나눠줄 사용자 블록들이 생성되는 공간 시작!
+ * [144번지] ── 실제 malloc으로 나눠줄 사용자 블록들이 생성되는 공간 시작!
  */
 int mm_init(void)
 {
-    /* 1. 크기별 가용 리스트 헤더 배열(96B) + 힙 기초 블록(16B) 총 112B를 한 번에 할당 */
+    /* 1. 크기별 가용 리스트 HEAD 칸(128B) + 힙 기초 블록(16B) 총 144B를 한 번에 할당 */
     if ((seg_listp = mem_sbrk(LISTNUM * DSIZE + 4 * WSIZE)) == (void *)-1)
         return -1;
-    /* 2. 12개 리스트 헤더 초기화 (모두 빈 상태인 NULL로 설정) */
+    /* 2. 16개 리스트 HEAD 초기화 (모두 빈 상태인 NULL로 설정)
+       extend_heap 안에서 insert_block이 불리므로 반드시 그 전에 해야 한다. */
     for (int i = 0; i < LISTNUM; i++)
     {
-        /* 12개 리스트 헤더를 널로 초기화한다. */
         HEAD(i) = NULL;
     }
-    /* 3. heap_listp를 가용 리스트 배열 바로 뒤(96바이트 오프셋)로 지정 */
+    /* 3. heap_listp를 HEAD 칸 바로 뒤(128바이트 오프셋)로 지정 */
     heap_listp = seg_listp + (LISTNUM * DSIZE);
     /* 4. 기초 블록 값 채우기 (패딩, 프롤로그 헤더/풋터, 에필로그 헤더) */
-    PUT(heap_listp, 0);                            // Alignment padding (96~99)
-    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1)); // Prologue header   (100~103)
-    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); // Prologue footer   (104~107)
-    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     // Epilogue header   (108~111)
-    /* 5. heap_listp 포인터를 프롤로그 블록 뒤(104번지)로 이동하여 기준점 설정 */
+    PUT(heap_listp, 0);                            // Alignment padding (128~131)
+    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1)); // Prologue header   (132~135)
+    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1)); // Prologue footer   (136~139)
+    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     // Epilogue header   (140~143)
+    /* 5. heap_listp 포인터를 프롤로그 헤더 뒤(136번지)로 이동하여 기준점 설정 */
     heap_listp += (2 * WSIZE);
     /* 6. CHUNKSIZE만큼 힙을 확장하여 첫 번째 가용 블록 생성 */
-    if (extend_heap(CHUNKSIZE / WSIZE) == NULL)
+    if (extend_heap(48 / WSIZE) == NULL)
         return -1;
     CHECKHEAP();
     return 0;
 }
 
-/* extend_heap 함수 - 힙을 words 워드만큼 늘려 새 가용 블록을 만든다.
-새 가용 블록의 bp
-*/
+/*
+ * extend_heap - 힙을 words 워드만큼 늘려 새 가용 블록을 만든다.
+ * 옛 에필로그 자리에 새 블록 헤더를 쓰고, 끝에 에필로그를 다시 세운 뒤
+ * 앞 블록이 가용이면 합친다. 반환값: 새(또는 합쳐진) 가용 블록의 bp
+ */
 static void *extend_heap(size_t words)
 {
     char *bp;
     size_t size;
     /* [정렬 상태 유지] 워드 개수를 짝수로 맞추어야 8의 배수 바이트가 된다. */
     size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
-    /* system call (mem_sbrk) 호출 */
     /* 힙을 size만큼 늘린다. 실패하면 -1이 오므로 정수로 바꿔 비교 */
     if ((long)(bp = mem_sbrk(size)) == -1)
         return NULL;
@@ -248,12 +261,22 @@ static void *extend_heap(size_t words)
     PUT(FTRP(bp), PACK(size, 0));
     /* New epilogue header - 에필로그 헤더*/
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
-    /* 이전 가용a 블록과 즉시 연결하여 통합함 */
+    /* 이전 가용 블록과 즉시 연결하여 통합함 */
     return coalesce(bp);
 }
-/* 크기 클래스를 사용한 seglist를 이용하는 방식임.  */
-/* get_class 함수 블록 크기가 속하는 크기 리스트 번호를 반환.*/
+
+/*
+ * get_class - 블록 크기가 속하는 크기 리스트 번호(0~15)를 반환한다.
+ * 작은 크기는 촘촘하게(24, 32, 48, 64 ...), 큰 크기는 2배씩 나눈다.
+ */
+static int get_class_raw(size_t size);
+/* get_class - 크기 클래스 번호. 256B보다 큰 블록은 마지막 리스트(7번) 하나에 모은다. */
 static int get_class(size_t size)
+{
+    int c = get_class_raw(size);
+    return c < LISTNUM ? c : LISTNUM - 1;
+}
+static int get_class_raw(size_t size)
 {
     if (size <= 24)
         return 0;
@@ -287,64 +310,63 @@ static int get_class(size_t size)
         return 14;
     return 15;
 }
-/* static find_first_fit */
+
+/*
+ * find_first_fit - asize가 속한 클래스부터 위로 올라가며,
+ * 각 리스트에서 처음 만나는 충분히 큰 가용 블록을 반환한다. 없으면 NULL.
+ */
 static void *find_first_fit(size_t asize)
 {
-    /* First Fit Search - 조정된 요청크기 이상인 첫번째로 맞는 가용블록을 반환함. */
     for (int i = get_class(asize); i < LISTNUM; i++)
-        /* 현재 헤드를 가리키고 있는 블록포인터로 전체 탐색을 진행한다. */
+        /* 현재 HEAD부터 SUCC를 따라 리스트를 탐색한다. */
         for (free_block_t *fp = HEAD(i); fp != NULL; fp = fp->succ)
         {
             /* 조정된 요청 크기 이상의 블록포인터를 찾아서 반환한다. */
             if (asize <= GET_SIZE(HDRP(fp)))
             {
-                /* 블록포인터를 반환한다. */
                 return (void *)fp;
             }
         }
-    /* 추가로 여기서 널을 반환하면 Mm_malloc에서 검사를 해서 알맞은 공간이 없으면 extend_heap을 한다. */
+    /* 여기서 NULL을 반환하면 mm_malloc에서 extend_heap을 한다. */
     return NULL;
 }
 
-/* find_best_fit 함수*/
+/*
+ * find_best_fit - asize가 속한 클래스부터 끝까지 훑어, 남는 크기가 가장 작은 블록을 반환한다.
+ * 딱 맞는 블록(남는 크기 0)을 만나면 바로 반환한다. 없으면 NULL.
+ */
 static void *find_best_fit(size_t asize)
 {
     /* best_bp는 널로 초기화한다. */
     char *best_bp = NULL;
     /* 무한대를 표현하는 방법은 양수 타입에서 1을 뺌.*/
     size_t min_extra = (size_t)-1;
-    /* best Fit Search - 가용리스트 전체를 탐색하여 가장 작은 가용 블록을 선택한다. */
     for (int i = get_class(asize); i < LISTNUM; i++)
-        /* 리스트를 탐색한다.*/
         for (free_block_t *fp = HEAD(i); fp != NULL; fp = fp->succ)
         {
             /* 조정된 요청 크기보다 블록 크기가 큰 가용 블록을 찾음 */
             if (asize <= GET_SIZE(HDRP(fp)))
             {
-                /* 남는 크기 = 현재 블록 크기 - 조정된 요청 크기를 빼서 계산한다. */
+                /* 남는 크기 = 현재 블록 크기 - 조정된 요청 크기 */
                 size_t remain = (GET_SIZE(HDRP(fp)) - asize);
-                /* 남는 크기가 0이 되면 즉시 현재 블록포인터를 반환한다.
-                 */
+                /* 남는 크기가 0이면 즉시 현재 블록포인터를 반환한다. */
                 if (remain == 0)
-                    /* 즉시 현재 블록포인터를 반환한다. */
                     return (void *)fp;
                 /* 가장 작은 크기의 블록을 찾기 위한 분기 */
                 else if (remain < min_extra)
                 {
-                    /* 남는 크기를 작은 것으로 갱신한다. */
                     min_extra = remain;
-                    /* 베스트 블록포인터의 주소를 갱신한다 */
                     best_bp = (void *)fp;
                 }
             }
         }
-    /* 가용리스트 순회를 다 도는 동안 즉시 반환은 못했지만,
-    베스트 블록포인터가 NULL이 아니면 반환한다.*/
+    /* 즉시 반환은 못했지만 후보가 있으면 반환한다. */
     if (best_bp != NULL)
         return best_bp;
     return NULL;
 }
 
+/* find_fit - current_fit_mode에 따라 first fit 또는 best fit으로 탐색한다. */
 static void *find_fit(size_t asize)
 {
     switch (current_fit_mode)
@@ -360,10 +382,10 @@ static void *find_fit(size_t asize)
     }
 }
 
-/* static seglist의 remove block */
-/* 가용리스트에서 현재 블록을 제외한 가용리스트를 만든다. */
-/* 내 앞 블록을 뒤에 연결하기 (앞블록이 없으면 가용리스트의 헤드) */
-/* 내 뒤 블록을 앞에 연결하기 (뒤 블록이 없는 경우는 없으니까) */
+/*
+ * remove_block - 가용 블록 bp를 자기 클래스 리스트에서 뺀다.
+ * 내 앞 블록과 내 뒤 블록을 서로 이어 준다 (앞이 없으면 HEAD를 내 뒤로).
+ */
 static void remove_block(void *bp)
 {
     /* 이 블록이 몇 번 리스트에 들어있는지 크기로 알아내겠다 */
@@ -381,11 +403,13 @@ static void remove_block(void *bp)
         fp->succ->pred = fp->pred;
 }
 
-/* static seglist의 insert block*/
-/* 가용 리스트 맨 앞(HEAD)에 새로 찾은 가용 블록(bp)을 연결한다. */
+/*
+ * insert_block - 가용 블록 bp를 자기 클래스 리스트 맨 앞(HEAD)에 넣는다 (LIFO).
+ * 옛 첫 블록 주소를 잃지 않도록 HEAD는 마지막에 바꾼다.
+ */
 static void insert_block(void *bp)
 {
-    /*이 블록의 헤더 크기를 보고 몇 번 리스트에 넣을 지 정한다. */
+    /* 이 블록의 헤더 크기를 보고 몇 번 리스트에 넣을 지 정한다. */
     int i = get_class(GET_SIZE(HDRP(bp)));
     /* void *bp를 구조체 포인터로 변환 */
     free_block_t *fp = (free_block_t *)bp;
@@ -403,14 +427,19 @@ static void insert_block(void *bp)
     HEAD(i) = fp;
 }
 
-/* static seglist의 place */
-/* 가용 블록을 분할하거나 분할하지 않고 최종 배치해서 할당 주소를 리턴함. */
+/*
+ * place - 가용 블록 bp에 asize 바이트를 배치하고, 실제로 할당된 블록의 주소를 반환한다.
+ * 남는 크기가 MINBLOCK 이상이면 분할한다.
+ *   - asize < PLACE_THRESHOLD: 앞쪽에 할당하고 뒤 조각은 가용 리스트에 넣는다. (방식 A)
+ *   - 그 외: 앞 조각은 가용으로 남기고 뒤쪽에 할당한다. 할당 주소가 bp와 달라진다. (방식 B)
+ * 남는 크기가 MINBLOCK보다 작으면 분할하지 않고 블록 전체를 할당한다.
+ * 호출자는 bp가 아니라 반환값을 써야 한다.
+ */
 static void *place(void *bp, size_t asize)
 {
     /* 현재 블록의 크기 */
     size_t csize = GET_SIZE(HDRP(bp));
-    /* free요청을 받으면 -> 새 프리리스트 반환 전에 -> place와 coalesce를 하는 거니까 */
-    /* place에서는 프리리스트에 insert를 하기 전에, 현재 프리할 블록을 가용 리스트에서 제외한다. */
+    /* 이 블록은 곧 할당되므로 먼저 가용 리스트에서 뺀다. */
     remove_block(bp);
     /* 현재 블록 크기에서 조정한 요청 크기를 뺐을때 최소블록 이상인 경우*/
     if ((csize - asize) >= (MINBLOCK))
@@ -419,16 +448,14 @@ static void *place(void *bp, size_t asize)
         if (asize < PLACE_THRESHOLD)
         {
             /* [방식 A] 작은 요청: 앞쪽에 조정된 요청 크기만큼 할당, 뒤쪽 가용 조각 */
-            /* 할당여부를 기록한다. */
             PUT(HDRP(bp), PACK(asize, 1));
             PUT(FTRP(bp), PACK(asize, 1));
             /* 포인터를 뒤쪽으로 옮긴다. */
             void *next_bp = NEXT_BLKP(bp);
-            /* 뒤쪽 가용 블록 포인터를 통해 뒤쪽 가용 블록 조각에 대한
-            헤더와 풋터를 설정한다. */
+            /* 뒤쪽 가용 조각의 헤더와 풋터를 설정한다. */
             PUT(HDRP(next_bp), PACK(csize - asize, 0));
             PUT(FTRP(next_bp), PACK(csize - asize, 0));
-            /* 뒤쪽 가용 블록 포인터를 통해 프리리스트의 맨 앞에 연결한다.  */
+            /* 뒤쪽 가용 조각을 프리리스트의 맨 앞에 연결한다.  */
             insert_block(next_bp);
             /* 앞쪽 할당 블록포인터를 반환한다. */
             return bp;
@@ -436,17 +463,16 @@ static void *place(void *bp, size_t asize)
         else
         {
             /* [방식 B] 큰 요청: 앞쪽 가용 조각, 뒤쪽 할당 */
-            /* 현재 블록 크기에서 조정된 요청 크기를 뺀 것을 block pointer에 더하여, 할당 블록 포인터를 만든다.*/
+            /* bp에서 (csize - asize)만큼 뒤가 할당 블록의 시작 */
             void *alloc_bp = (char *)bp + (csize - asize);
-            /* 1. 앞쪽 가용 블록에 헤더와 풋터를 설정한다.*/
-            /* 여기서 csize에서 csize - asize로 바뀌니까 위에서 미리 저장해둠. */
+            /* 1. 앞쪽 가용 조각에 헤더와 풋터를 설정한다.
+               (csize는 위에서 미리 저장해 두었다) */
             PUT(HDRP(bp), PACK(csize - asize, 0));
             PUT(FTRP(bp), PACK(csize - asize, 0));
             /* 2. 뒤쪽 할당 블록에 헤더와 풋터를 설정한다.  */
-            /* 할당 여부를 기록한다. */
             PUT(HDRP(alloc_bp), PACK(asize, 1));
             PUT(FTRP(alloc_bp), PACK(asize, 1));
-            /* 앞쪽 가용 블록을 프리리스트 맨 처음에 연결한다.  */
+            /* 앞쪽 가용 조각을 프리리스트 맨 처음에 연결한다.  */
             insert_block(bp);
             /* 뒤쪽 할당 블록 포인터를 반환한다. */
             return alloc_bp;
@@ -455,102 +481,91 @@ static void *place(void *bp, size_t asize)
     /* 최소 블록 크기보다 작아 분할 안하는 경우에는 현재 블록 크기를 할당함.*/
     else
     {
-        /* 현재 블록 크기를 헤더와 풋터에 설정한다. */
-        /* 할당 여부를 기록한다. */
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
-        /* 할당 블록 포인터를 반환한다. */
         return bp;
     }
 }
-/* 조정된 요청 크기 만드는 부분을 헬퍼함수로 만듦. */
+
+/*
+ * adjust_size - 사용자 요청 크기를 블록 크기(asize)로 바꾼다.
+ * 헤더·풋터 8B를 더하고 8의 배수로 올린다. 최소 MINBLOCK(24B).
+ */
 static size_t adjust_size(size_t size)
 {
-    size_t asize;
-    /* 사이즈가 8바이트 이하이면 */
     if (size <= DSIZE)
-        /* 조정된 요청 크기를 24바이트로 한다. */
         return MINBLOCK;
-    /* 조정된 요청 크기를 계산한다. */
     return DSIZE * ((size + DSIZE + (DSIZE - 1)) / DSIZE);
 }
+
 /*
- * mm_malloc - Allocate a block by incrementing the brk pointer.
- *     Always allocate a block whose size is a multiple of the alignment.
+ * mm_malloc - size 바이트를 담을 블록을 할당하고 payload 주소를 반환한다.
+ * 1) 큰 요청은 2^k 근처면 2^k로 올린다. 2) asize를 계산한다.
+ * 3) find_fit으로 가용 블록을 찾으면 place로 배치한다.
+ * 4) 없으면 힙을 늘린다 (작은 요청은 4KB를 한 번에) → place.
  */
-#if 1
 void *mm_malloc(size_t size)
 {
-    /* 만약 조정된 요청 크기 블록 사이즈에 맞는 가용 블록을 찾지 못햇을 경우 익스텐드 힙을 한다. */
     size_t extendsize;
-    /* 선언만 하고 뒤에서 초기화할 수 있음. */
     char *bp;
     /* size가 0일때 NULL을 반환한다.(이상한 요청) */
     if (size == 0)
         return NULL;
+    /* 요청 크기가 256B 이상이고 2^k의 7/8 이상이면 2^k로 올려 받는다. */
+    {
+        size_t p = 8;
+        while (p < size)
+            p <<= 1;
+        if (size >= 100 && size < 1024 && size * 8 >= p * 7)
+            size = p;
+    }
     size_t asize = adjust_size(size);
-    /* find_fit함수로 조정된 요청 크기에 맞는 가용 블록의 시작주소를 반환하는 조건문 */
+    /* 조정된 요청 크기에 맞는 가용 블록을 찾으면 그 자리에 배치한다. */
     if ((bp = find_fit(asize)) != NULL)
     {
-        /* 조정된 요청 크기에 맞는 가용 블록의 시작주소에 배치를 진행한다. 분할을 하거나 하지 않고 배치를 하여 최종 확정된 가용 블록 주소를 반환한다. */
+        /* 분할을 하거나 하지 않고 배치하여 최종 할당 주소를 받는다. */
         bp = place(bp, asize);
         CHECKHEAP();
-        /* 최종 배치된 가용 블록의 시작 주소를 반환한다. */
         return bp;
     }
-    /* 만일 find_fit함수로 조정된 요청 크기에 맞는 가용 블록을 찾지 못한다면 Extendheap을 진행하기 전,
-    extendsize를 계산한다 (조정된 요청 크기와 청크사이즈 둘중에 최대값으로 한다) */
-    extendsize = MAX(asize, CHUNKSIZE);
-    /* extendsize를 워드사이즈로 바꾸어, extend_heap을 진행하여 블록포인터의 시작주소가 NULL이 되면 NULL을 반환한다. */
+    /* 맞는 블록이 없으면 힙을 늘린다.
+       작은 요청은 4KB를 한 번에 받아 작은 블록끼리 모이게 하고 (큰 블록 사이에 끼지 않도록),
+       큰 요청은 asize와 CHUNKSIZE 중 큰 쪽만큼 받는다. */
+    extendsize = (asize < 80) ? MAX(asize, SMALL_CHUNKSIZE)
+                              : MAX(asize, CHUNKSIZE);
     bp = extend_heap(extendsize / WSIZE);
     if (bp == NULL)
         return NULL;
     /* 새 힙공간의 bp 위치에 asize만큼 할당 및 분할 처리  */
     bp = place(bp, asize);
     CHECKHEAP();
-    /* 할당된 메모리 주소 반환 */
     return bp;
 }
 
-#endif
-#if 0
-void *mm_malloc(size_t size)
-{
-    int newsize = ALIGN(size + SIZE_T_SIZE);
-    void *p = mem_sbrk(newsize);
-    if (p == (void *)-1)
-        return NULL;
-    else
-    {
-        *(size_t *)p = size;
-        return (void *)((char *)p + SIZE_T_SIZE);
-    }
-}
-#endif
-
 /*
- * mm_free - Freeing a block does nothing.
+ * mm_free - 블록을 가용으로 표시하고, 이웃 가용 블록과 병합한 뒤 리스트에 넣는다.
  */
 void mm_free(void *ptr)
 {
-    /* 현재 블록포인터의 헤드를 통해 사이즈를 찾는다. */
+    /* 현재 블록포인터의 헤더를 통해 사이즈를 찾는다. */
     size_t size = GET_SIZE(HDRP(ptr));
-    /* 헤더에 사이즈와 할당여부를 0으로 기록한다. */
+    /* 헤더와 풋터의 할당여부를 0으로 기록한다. */
     PUT(HDRP(ptr), PACK(size, 0));
     PUT(FTRP(ptr), PACK(size, 0));
-    /* 방금 프리된 블록을 이웃 가용 블록과 병합하고, 최종 확정된 블록을 가용 리스트에 추가한다. */
+    /* 이웃 가용 블록과 병합하고, 최종 블록을 가용 리스트에 추가한다. */
     coalesce(ptr);
     CHECKHEAP();
 }
 
-/* 헬퍼 함수 */
-/* end 블록의 풋터 부터 start 블록의 헤더까지 바이트 크기를 계산하고
-할당여부도 기록을 하여 시작 블록 포인터를 반환하는 함수 */
+/*
+ * combines_blocks - start 블록 헤더부터 end 블록 풋터까지를 하나의 블록으로 기록한다.
+ * 바깥 헤더(start)와 바깥 풋터(end) 두 곳에만 합친 크기를 쓰고 start를 반환한다.
+ */
 static void *combines_blocks(void *start_ptr, void *end_ptr, int alloc_flag)
 {
-    /* 1. 마지막 블록 포인터의 풋터 끝점부터 시작 블록 포인터의 헤더까지 전체 바이트 크기 계산 */
+    /* 1. end 블록 풋터 끝부터 start 블록 헤더까지 전체 바이트 크기 계산 */
     size_t total_size = (char *)FTRP(end_ptr) + WSIZE - (char *)HDRP(start_ptr);
-    /* 2. 시작 블록 포인터와 마지막 블록 포인터를 기록 */
+    /* 2. 바깥 헤더와 바깥 풋터에 기록 */
     PUT(HDRP(start_ptr), PACK(total_size, alloc_flag));
     PUT(FTRP(end_ptr), PACK(total_size, alloc_flag));
     /* 3. 시작 블록 포인터를 반환한다. */
@@ -563,14 +578,14 @@ static void *combines_blocks(void *start_ptr, void *end_ptr, int alloc_flag)
  *   case 2: 앞(할당) 뒤(가용) -> 뒤와 병합
  *   case 3: 앞(가용) 뒤(할당) -> 앞과 병합
  *   case 4: 앞(가용) 뒤(가용) -> 셋 다 병합
- *   coalesce(병합 내지 연결)을 하기 전에 미리 remove_block으로 기존 블록에 대해 가용리스트에서 제거를 미리한다.
+ *   병합 전에 remove_block으로 이웃 가용 블록을 리스트에서 먼저 뺀다.
  *   합쳐진 가용 블록은 insert_block으로 가용 리스트 맨 처음에 넣는다.
  */
 void *coalesce(void *ptr)
 {
-    /* 이전 할당 여부 - 경계 태그 방식에서 이전 블록의 할당여부는 풋터에서 가져온다. */
+    /* 이전 블록의 할당여부는 이전 블록의 풋터에서 가져온다 (경계 태그). */
     size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(ptr)));
-    /* 다음 할당 여부 - 다음 힙 리스트 메모리 주소를 가리키는 포인터를 헤더를 가리키게 하여 할당여부를 알아낸다. */
+    /* 다음 블록의 할당여부는 다음 블록의 헤더에서 가져온다. */
     size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
     /* Case1 : 이전과 다음 모두 할당 블록이면*/
     if (prev_alloc && next_alloc)
@@ -579,81 +594,70 @@ void *coalesce(void *ptr)
     /* Case 2: 다음 블록만 가용 블록 상태 */
     else if (prev_alloc && !next_alloc)
     {
-        /* (병합을 하면 시작 포인터가 바뀐다)
-        다음 블록 포인터가 제거된 가용리스트를 만든다.*/
         remove_block(NEXT_BLKP(ptr));
-        /* 현재 블록포인터부터 다음 블록포인터까지를 합친 (사이즈와 할당여부) 블록포인터의 시작주소를 반환한다. */
         ptr = combines_blocks(ptr, NEXT_BLKP(ptr), 0);
     }
     /* Case 3: 이전 블록만 가용 블록 상태 */
-    else if (!prev_alloc && next_alloc) // Case 3
+    else if (!prev_alloc && next_alloc)
     {
-        /* (병합을 하면 시작 포인터가 바뀐다.)  */
         remove_block(PREV_BLKP(ptr));
-        /* 이전 블록포인터부터 현재 블록포인터를 합친 (사이즈와 할당여부) 블록포인터의 시작주로를 반환한다.*/
         ptr = combines_blocks(PREV_BLKP(ptr), ptr, 0);
     }
-    /* 이전 블록과 다음 블록 모두 가용 블록인 경우 */
+    /* Case 4: 이전 블록과 다음 블록 모두 가용 블록인 경우 */
     else
     {
-        /* (병합을 하면 시작 포인터가 바뀐다.)
-        이전 블록 포인터를 가용리스트에서 제거한다.*/
         remove_block(PREV_BLKP(ptr));
-        /* (병합을 하면 시작 포인터가 바뀐다.)
-        다음 블록 포인터를 가용리스트에서 제거한다.*/
         remove_block(NEXT_BLKP(ptr));
-        /* 이전블록포인터부터 다음 블록포인터까지를 합친 (사이즈와 할당여부) 블록포인터의 시작주소를 반환한다. */
         ptr = combines_blocks(PREV_BLKP(ptr), NEXT_BLKP(ptr), 0);
     }
     /* 합쳐진 가용 블록을 가용 리스트의 맨 앞에 삽입한다. */
     insert_block(ptr);
-    /* 블록 포인터의 시작주소를 반환한다. */
     return ptr;
 }
+
 /*
- * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
+ * mm_realloc - 블록 크기를 size로 바꾼다. 이사(새 할당 + 복사)를 최대한 피한다.
+ * 1) 지금 블록이 충분하면 그대로 반환
+ * 2) 뒤가 에필로그면 모자란 만큼만 힙을 늘려 뒤에 빈 블록을 만든다
+ * 3) 뒤가 가용이고 합쳐서 충분하면 분할 없이 통째로 흡수 (곧 다시 커질 여유분)
+ * 4) 안 되면 mm_malloc → memcpy(작은 쪽 크기만큼) → mm_free
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    /* 만약 기존 포인터 주소가 NULL이면 말록을 새로 할당한다. */
+    /* ptr이 NULL이면 malloc과 같다. */
     if (ptr == NULL)
         return mm_malloc(size);
-    /* 사이즈가 0인 잘못된 요청이 있으면 */
+    /* size가 0이면 free 후 NULL */
     if (size == 0)
     {
-        /* 해당 포인터에 대해 프리를 한다. */
         mm_free(ptr);
-        /* NULL로 해제 후 무효화를 한다.  */
         return NULL;
     }
     /* 조정된 요청 크기를 구한다. */
     size_t asize = adjust_size(size);
     /* 지금 블록 전체 크기를 구한다. */
     size_t oldblock = GET_SIZE(HDRP(ptr));
-    /* 다음 포인터 변수 */
+    /* 다음 블록 포인터 */
     void *next = NEXT_BLKP(ptr);
-    /* 1. 현재 블록의 전체 크기가 조정된 요청 크기 이상인 경우 현재 포인터를 반환한다. */
+    /* 1. 지금 블록으로 충분하면 그대로 반환 */
     if (oldblock >= asize)
         return ptr;
-    /* [다음이 에필로그인 경우] */
+    /* 2. 다음이 에필로그면 모자란 만큼만 힙을 늘려 그 자리에서 바로 키운다.
+       (빈 블록을 만들지 않으므로 최소 블록 24B 제한 없이 8B 단위로 정확히 늘린다) */
     if (GET_SIZE(HDRP(next)) == 0)
     {
-        /* 조정된 요청 크기에서 지금 블록의 전체 크기를 뺀 것을 필요 크기라고 한다.*/
         size_t need = asize - oldblock;
-        /* 필요 크기가 최소 요청 크기보다 작은 경우 필요크기를 최소 블록크기로 한다. */
-        if (need < MINBLOCK)
-            need = MINBLOCK;
-        /* 필요 크기를 워드사이즈로 변환하여 익스텐드힙을 하여 힙을 할당하지 못한 경우 널을 반환한다. */
-        if (extend_heap(need / WSIZE) == NULL)
+        if (mem_sbrk(need) == (void *)-1)
             return NULL;
-        /* 새로 생긴 빈 블록 공간에 대해 포인터를 갱신한다. */
-        next = NEXT_BLKP(ptr);
+        PUT(HDRP(ptr), PACK(asize, 1));
+        PUT(FTRP(ptr), PACK(asize, 1));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); /* 새 에필로그 */
+        CHECKHEAP();
+        return ptr;
     }
-    /* 다음 블록 포인터가 가리키는 헤더를 통해 nextblock을 구한다. */
     size_t nextblock = GET_SIZE(HDRP(next));
     size_t totalsize = oldblock + nextblock;
-    size_t remainsize = totalsize - asize;
-    /* [제자리 확장을 할 수 있는 경우를 확인] */
+    /* 3. 뒤가 가용이고 합쳐서 충분하면 제자리 확장 */
     if (!GET_ALLOC(HDRP(next)) && totalsize >= asize)
     {
         /* 뒤 블록을 리스트에서 뺀다  */
@@ -664,46 +668,20 @@ void *mm_realloc(void *ptr, size_t size)
         CHECKHEAP();
         return ptr;
     }
-    /* [제자리 확장으로 안 되는 경우: 새 블록 + 복사 + 반납] */
+    /* 4. 제자리 확장이 안 되면: 새 블록 + 복사 + 반납 */
     void *newptr = mm_malloc(size);
-    /* 말록을 통해 새로운 포인터를 반환받지 못한 경우 NULL을 반환한다.  */
     if (newptr == NULL)
         return NULL;
-    /* 지금 블록 크기에서 8(헤더와 풋터)를 제외한 사이즈를 구한다.*/
+    /* 옛 payload 크기 = 블록 크기 - 헤더·풋터 8B */
     size_t oldsize = oldblock - DSIZE;
-    /* 복사 사이즈는 사용자 요청 크기보다 지금 블록 크기가 큰지를 보고, 지금 블록 크기가 더 큰 경우 사용자 요청 크기를 카피 사이즈로 하고, 사용자 요청 크기가 더 큰 경우 지금 블록 크기를 복사 사이즈로 한다. */
+    /* 새 크기와 옛 payload 중 작은 쪽만큼 복사한다. */
     size_t copysize = (size < oldsize) ? size : oldsize;
-    /* 기존 포인터에서 새로운 포인터로 복사 사이즈를 통해 복사시킨다. */
     memcpy(newptr, ptr, copysize);
-    /* 기존 포인터에 대해 프리를 한다. */
     mm_free(ptr);
     CHECKHEAP();
-    /* 새로운 포인터를 반환한다. */
     return newptr;
 }
 
-/*
- * mm_check - 힙과 가용 리스트의 일관성 검사. 문제가 있으면 0 반환.
- *
- * [힙 검사]
- *  1. prologue 헤더가 DSIZE/할당 상태인가
- *  2. 모든 블록 bp가 8바이트 정렬인가
- *  3. header와 footer가 일치하는가
- *  4. 블록 크기 >= MINBLOCK 인가
- *  5. 연속된 가용 블록이 없는가 (coalesce 누락 탐지)
- *  6. 블록이 힙 범위 안에 있는가
- *  7. 블록끼리 겹치지 않는가
- *  8. epilogue가 0/1 인가
- * [리스트 검사]
- *  9.  리스트의 모든 블록이 가용 상태인가
- *  10. 리스트 포인터가 힙 범위 안을 가리키는가
- *  11. PRED/SUCC 양방향 연결이 일치하는가
- *  12. 첫 노드의 PRED가 NULL인가
- *  13. 힙의 가용 블록 수 == 리스트 노드 수 인가
- *  14. 리스트에 사이클이 없는가
- *
- *  사용법: #define DEBUG 켜면 CHECKHEAP()이 매 연산 후 호출됨
- */
 /*
  * mm_check - 힙과 가용 리스트의 일관성 검사. 문제가 있으면 0 반환.
  *
@@ -716,7 +694,7 @@ void *mm_realloc(void *ptr, size_t size)
  *  6. 연속된 가용 블록이 없는가 (coalesce 누락 탐지)
  *  7. epilogue가 0/1 인가
  *  8. 블록끼리 겹치지 않는가
- * [리스트 검사] - 12개 크기별 리스트를 각각 훑는다
+ * [리스트 검사] - 16개 크기별 리스트를 각각 훑는다
  *  9.  리스트의 모든 블록이 가용 상태인가
  *  10. SUCC가 힙 범위 안을 가리키는가
  *  11. PRED/SUCC 양방향 연결이 일치하는가
@@ -799,7 +777,7 @@ int mm_check(void)
         ok = 0;
     }
 
-    /* 리스트 순회: 0번부터 11번 리스트까지 하나씩 */
+    /* 리스트 순회: 0번부터 15번 리스트까지 하나씩 */
     for (int i = 0; i < LISTNUM; i++)
     {
         // 13) 각 리스트의 맨 앞 블록은 PRED가 NULL이어야 한다
@@ -852,10 +830,10 @@ int mm_check(void)
                 ok = 0;
             }
         } // 안쪽 for 끝: i번 리스트 다 봄
-    } // 바깥 for 끝: 12개 리스트 다 봄
+    } // 바깥 for 끝: 16개 리스트 다 봄
 
     /*  마무리: 모든 for 밖 */
-    // 14) 힙에서 센 빈 블록 수 == 12개 리스트에서 센 블록 수
+    // 14) 힙에서 센 빈 블록 수 == 16개 리스트에서 센 블록 수
     if (heap_free != list_free)
     {
         printf("[mm_check] 빈 블록 수 불일치: 힙=%d, 리스트=%d\n", heap_free, list_free);
